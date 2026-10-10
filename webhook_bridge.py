@@ -9,6 +9,7 @@ import uvicorn
 
 import config
 from megabull_client import MegaBullClient
+from cloud_worker import start_cloud_worker_thread
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,9 +19,9 @@ logging.basicConfig(
 logger = logging.getLogger("TradingBridge")
 
 app = FastAPI(
-    title="TradingView to MegaBull Execution Bridge",
-    description="Automated Webhook Bridge routing TradingView alerts to MegaBull Paper Trading",
-    version="2.1.0",
+    title="TradingView & Autonomous MegaBull Cloud System",
+    description="24/7 Cloud Automated Trading System for Indian Markets",
+    version="3.0.0",
 )
 
 megabull_client = None
@@ -35,6 +36,12 @@ if config.TARGET_BROKER == "megabull":
     else:
         logger.info("MegaBull Paper Trading Bridge running in SIMULATION/DEV mode.")
 
+# Start the 24/7 Autonomous Cloud Trader Thread on Render
+@app.on_event("startup")
+def on_startup():
+    logger.info("App starting up. Launching 24/7 autonomous cloud trader...")
+    start_cloud_worker_thread()
+
 
 class WebhookPayload(BaseModel):
     secret: str = Field(..., description="Authentication passphrase")
@@ -43,7 +50,7 @@ class WebhookPayload(BaseModel):
     qty: float = Field(default=1.0, gt=0, description="Order quantity")
     sl: Optional[float] = Field(default=None, description="Stop Loss trigger price")
     tp: Optional[float] = Field(default=None, description="Take Profit target price")
-    duration: Optional[str] = Field(default="CNC", description="Order duration: 'CNC' (delivery) or 'MIS' (intraday)")
+    duration: Optional[str] = Field(default="MIS", description="Order duration: 'MIS' (intraday) or 'CNC' (delivery)")
 
 
 @app.get("/health")
@@ -53,44 +60,15 @@ def health_check():
         "broker": config.TARGET_BROKER,
         "mode": "simulation" if config.SIMULATION_MODE else "live_megabull_paper",
         "megabull_connected": megabull_client is not None and not config.SIMULATION_MODE,
+        "autonomous_worker": "running_24_7",
         "timestamp": datetime.utcnow().isoformat(),
     }
-
-
-@app.get("/buy-now")
-def buy_now_endpoint(symbol: str = "HDFCBANK", qty: int = 5, duration: str = "CNC"):
-    """Convenience endpoint to trigger an instant buy order on MegaBull."""
-    if not megabull_client or config.SIMULATION_MODE:
-        return {
-            "status": "success",
-            "mode": "simulation",
-            "message": f"Simulated BUY of {qty} shares of {symbol} (CNC delivery)",
-            "order_id": f"sim-{uuid.uuid4().hex[:8]}",
-        }
-
-    try:
-        resp = megabull_client.place_order(
-            symbol=symbol,
-            action="BUY",
-            qty=qty,
-            duration=duration,
-            order_type="MKT",
-        )
-        return {
-            "status": "success",
-            "mode": "live_megabull",
-            "message": f"Successfully bought {qty} shares of {symbol} on MegaBull!",
-            "order_response": resp,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/webhook")
 @app.post("/tradingview-webhook")
 async def handle_tradingview_alert(payload: WebhookPayload):
     if payload.secret != config.WEBHOOK_SECRET:
-        logger.warning(f"Unauthorized alert attempt with invalid secret: {payload.secret}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication secret token",
@@ -99,7 +77,7 @@ async def handle_tradingview_alert(payload: WebhookPayload):
     action = payload.action.lower()
     symbol = payload.symbol.upper().replace(".NS", "").replace(".BO", "")
     qty = int(payload.qty)
-    duration = (payload.duration or "CNC").upper()
+    duration = (payload.duration or "MIS").upper()
 
     logger.info(f"[ALERT] Action: {action.upper()} | Symbol: {symbol} | Qty: {qty} | Duration: {duration}")
 
@@ -112,7 +90,6 @@ async def handle_tradingview_alert(payload: WebhookPayload):
             "action": action,
             "symbol": symbol,
             "qty": qty,
-            "duration": duration,
         }
 
     try:
