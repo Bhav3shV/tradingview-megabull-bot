@@ -1,4 +1,5 @@
 import logging
+import sqlite3
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -9,19 +10,19 @@ import uvicorn
 
 import config
 from megabull_client import MegaBullClient
-from cloud_worker import start_cloud_worker_thread
+from cloud_daemon import start_daemon_background, get_engine
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()],
 )
-logger = logging.getLogger("TradingBridge")
+logger = logging.getLogger("AutonomousCloudStation")
 
 app = FastAPI(
-    title="TradingView & Autonomous MegaBull Cloud System",
-    description="24/7 Cloud Automated Trading System for Indian Markets",
-    version="3.0.0",
+    title="Autonomous Institutional Quantitative Trading Engine",
+    description="100% Zero-Touch Autonomous Trading System for Indian Markets",
+    version="4.0.0",
 )
 
 megabull_client = None
@@ -29,95 +30,97 @@ if config.TARGET_BROKER == "megabull":
     if not config.SIMULATION_MODE:
         try:
             megabull_client = MegaBullClient(config.MEGABULL_API_KEY)
-            logger.info("MegaBull Paper Trading Client initialized with live API key!")
+            logger.info("MegaBull Live Client successfully initialized!")
         except Exception as e:
-            logger.error(f"Error initializing MegaBull Client: {e}. Falling back to simulation.")
+            logger.error(f"Error initializing MegaBull Client: {e}")
             config.SIMULATION_MODE = True
     else:
-        logger.info("MegaBull Paper Trading Bridge running in SIMULATION/DEV mode.")
+        logger.info("MegaBull running in Simulation Mode.")
 
-# Start the 24/7 Autonomous Cloud Trader Thread on Render
+
+# Launch the 100% Autonomous Daemon when Render boots
 @app.on_event("startup")
 def on_startup():
-    logger.info("App starting up. Launching 24/7 autonomous cloud trader...")
-    start_cloud_worker_thread()
-
-
-class WebhookPayload(BaseModel):
-    secret: str = Field(..., description="Authentication passphrase")
-    action: str = Field(..., description="'buy', 'sell', or 'close'")
-    symbol: str = Field(..., description="Ticker symbol (e.g. HDFCBANK, RELIANCE, NIFTY)")
-    qty: float = Field(default=1.0, gt=0, description="Order quantity")
-    sl: Optional[float] = Field(default=None, description="Stop Loss trigger price")
-    tp: Optional[float] = Field(default=None, description="Take Profit target price")
-    duration: Optional[str] = Field(default="MIS", description="Order duration: 'MIS' (intraday) or 'CNC' (delivery)")
+    logger.info("Booting Autonomous Daemon thread on Cloud...")
+    start_daemon_background()
 
 
 @app.get("/health")
 def health_check():
+    engine = get_engine()
+    now_ist = engine.get_ist()
     return {
         "status": "online",
         "broker": config.TARGET_BROKER,
         "mode": "simulation" if config.SIMULATION_MODE else "live_megabull_paper",
         "megabull_connected": megabull_client is not None and not config.SIMULATION_MODE,
-        "autonomous_worker": "running_24_7",
-        "timestamp": datetime.utcnow().isoformat(),
+        "autonomous_daemon": "active_24_7",
+        "market_active_now": engine.is_market_active(),
+        "ist_time": now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
     }
+
+
+@app.get("/telemetry")
+def get_telemetry():
+    """Returns real-time telemetry, active positions, and audit trade history."""
+    engine = get_engine()
+    
+    # Query audit history from SQLite
+    history = []
+    try:
+        conn = sqlite3.connect(engine.db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT timestamp, symbol, action, strategy, regime, entry_price, exit_price, exit_reason, pnl_amount FROM audit_trades ORDER BY id DESC LIMIT 20")
+        rows = cur.fetchall()
+        for r in rows:
+            history.append({
+                "time": r[0], "symbol": r[1], "action": r[2], "strategy": r[3],
+                "regime": r[4], "entry": r[5], "exit": r[6], "reason": r[7], "pnl": r[8]
+            })
+        conn.close()
+    except Exception as e:
+        logger.error(f"Telemetry DB error: {e}")
+
+    return {
+        "ist_time": engine.get_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+        "market_active": engine.is_market_active(),
+        "active_positions_count": len(engine.positions),
+        "active_positions": engine.positions,
+        "closed_trades_history": history,
+    }
+
+
+class WebhookPayload(BaseModel):
+    secret: str
+    action: str
+    symbol: str
+    qty: float = 1.0
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    duration: Optional[str] = "MIS"
 
 
 @app.post("/webhook")
 @app.post("/tradingview-webhook")
-async def handle_tradingview_alert(payload: WebhookPayload):
+async def handle_manual_webhook(payload: WebhookPayload):
     if payload.secret != config.WEBHOOK_SECRET:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication secret token",
-        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     action = payload.action.lower()
     symbol = payload.symbol.upper().replace(".NS", "").replace(".BO", "")
     qty = int(payload.qty)
     duration = (payload.duration or "MIS").upper()
 
-    logger.info(f"[ALERT] Action: {action.upper()} | Symbol: {symbol} | Qty: {qty} | Duration: {duration}")
-
     if config.SIMULATION_MODE or megabull_client is None:
-        sim_order_id = f"sim-{uuid.uuid4().hex[:8]}"
-        return {
-            "status": "success",
-            "mode": "simulation",
-            "order_id": sim_order_id,
-            "action": action,
-            "symbol": symbol,
-            "qty": qty,
-        }
+        return {"status": "success", "mode": "simulation", "action": action, "symbol": symbol, "qty": qty}
 
     try:
         if action == "close":
-            close_resp = megabull_client.close_position(symbol)
-            return {"status": "success", "response": close_resp}
-
-        order_side = "BUY" if action == "buy" else "SELL"
-        order_resp = megabull_client.place_order(
-            symbol=symbol,
-            action=order_side,
-            qty=qty,
-            duration=duration,
-            order_type="MKT",
-        )
-
-        return {
-            "status": "success",
-            "order_id": order_resp.get("id"),
-            "symbol": symbol,
-            "action": order_side,
-            "qty": qty,
-            "response": order_resp,
-        }
-
-    except Exception as exc:
-        logger.error(f"Error executing order on MegaBull: {exc}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"MegaBull execution error: {str(exc)}")
+            return {"status": "success", "response": megabull_client.close_position(symbol)}
+        resp = megabull_client.place_order(symbol=symbol, action=action.upper(), qty=qty, duration=duration, order_type="MKT")
+        return {"status": "success", "order_id": resp.get("id"), "response": resp}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
